@@ -56,13 +56,6 @@ Each log entry must be a valid JSON object on a single line with the following s
 - `.log.1`, `.log.2`, etc. (rotated logs)
 - `.txt.1`, `.txt.2`, etc. (rotated text logs)
 
-## Version Information
-
-- **Version**: 1.0.0
-- **Last Updated**: 2025
-- **Compatible Python**: 3.7+
-- **Streamlit Version**: 1.0.0+
-
 ---
 
 **Note**: This application is specifically designed for structured JSON log files. Standard text-based log formats (like Apache, Nginx, or syslog) are not supported and will need to be converted to the required JSON format before analysis.
