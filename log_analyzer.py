@@ -3,6 +3,9 @@ import pandas as pd
 import json
 import re
 from pathlib import Path
+from datetime import datetime, timedelta
+from fuzzywuzzy import fuzz
+from fuzzywuzzy import process
 
 def parse_log_line(line):
     try:
@@ -65,13 +68,11 @@ def infer_timestamp_format(timestamps):
         '%a %b %d %H:%M:%S %Y',  # Mon Dec 25 10:30:45 2023
     ]
     
-    # Sample up to 100 non-null timestamps for format detection
     sample_timestamps = [ts for ts in timestamps if pd.notna(ts) and ts.strip()][:100]
     
     if not sample_timestamps:
         return None
     
-    # Try each format and count successful parses
     best_format = None
     best_count = 0
     
@@ -88,7 +89,6 @@ def infer_timestamp_format(timestamps):
             best_count = count
             best_format = fmt
     
-    # Only return format if it works for at least 50% of samples
     if best_count >= len(sample_timestamps) * 0.5:
         return best_format
     
@@ -116,16 +116,95 @@ def parse_timestamps_efficiently(df):
     
     return df
 
-def filter_logs(df, search_term, log_levels):
+def fuzzy_search_messages(df, search_term, threshold=70):
+    if not search_term or df.empty:
+        return df
+    
+    messages = df['message'].fillna('').astype(str)
+    
+    matches = []
+    for idx, message in enumerate(messages):
+        if message.strip(): 
+            score = fuzz.partial_ratio(search_term.lower(), message.lower())
+            if score >= threshold:
+                matches.append((idx, score))
+    
+    if not matches:
+        return pd.DataFrame(columns=df.columns)
+    
+    matches.sort(key=lambda x: x[1], reverse=True)
+    indices = [match[0] for match in matches]
+    
+    result_df = df.iloc[indices].copy()
+    result_df['fuzzy_score'] = [match[1] for match in matches]
+    
+    return result_df
+
+def filter_logs(df, search_term, log_levels, selected_files, date_range, 
+                time_range, selected_functions, selected_names, 
+                use_fuzzy_search=False, fuzzy_threshold=70):
     filtered_df = df.copy()
     
+    # File filtering
+    if selected_files:
+        filtered_df = filtered_df[filtered_df['source_file'].isin(selected_files)]
+    
+    # Log level filtering
     if log_levels:
         filtered_df = filtered_df[filtered_df['level'].isin(log_levels)]
     
+    # Date range filtering
+    if date_range and not filtered_df.empty:
+        start_date, end_date = date_range
+        if not filtered_df['timestamp'].empty:
+            mask = (filtered_df['timestamp'].dt.date >= start_date) & (filtered_df['timestamp'].dt.date <= end_date)
+            filtered_df = filtered_df[mask]
+    
+    # Time range filtering
+    if time_range and not filtered_df.empty:
+        start_time, end_time = time_range
+        if not filtered_df['timestamp'].empty:
+            mask = (filtered_df['timestamp'].dt.time >= start_time) & (filtered_df['timestamp'].dt.time <= end_time)
+            filtered_df = filtered_df[mask]
+    
+    # Function filtering
+    if selected_functions:
+        filtered_df = filtered_df[filtered_df['function'].isin(selected_functions)]
+    
+    # Logger name filtering
+    if selected_names:
+        filtered_df = filtered_df[filtered_df['name'].isin(selected_names)]
+    
+    # Search term filtering (fuzzy or exact)
     if search_term:
-        filtered_df = filtered_df[filtered_df['message'].str.contains(search_term, case=False, na=False)]
-        
+        if use_fuzzy_search:
+            filtered_df = fuzzy_search_messages(filtered_df, search_term, fuzzy_threshold)
+        else:
+            filtered_df = filtered_df[filtered_df['message'].str.contains(search_term, case=False, na=False)]
+    
     return filtered_df
+
+def get_log_stats(df):
+    if df.empty:
+        return {}
+    
+    stats = {
+        'total_entries': len(df),
+        'date_range': None,
+        'level_distribution': df['level'].value_counts().to_dict(),
+        'file_distribution': df['source_file'].value_counts().to_dict(),
+        'top_functions': df['function'].value_counts().head(10).to_dict(),
+        'top_loggers': df['name'].value_counts().head(10).to_dict(),
+        'errors_count': len(df[df['level'] == 'ERROR']),
+        'warnings_count': len(df[df['level'] == 'WARNING']),
+    }
+    
+    if 'timestamp' in df.columns and not df['timestamp'].empty:
+        valid_timestamps = df['timestamp'].dropna()
+        if not valid_timestamps.empty:
+            stats['date_range'] = (valid_timestamps.min(), valid_timestamps.max())
+    
+    return stats
 
 def main():
     st.set_page_config(page_title="Log Analyzer", layout="wide")
@@ -147,21 +226,15 @@ def main():
         help="Select log files (.log, .txt, .log.1, .log.2, etc.)"
     )
     
-    # Check if files were removed and update accordingly
     if uploaded_files:
         current_file_names = [file.name for file in uploaded_files]
-        
-        # If no files are uploaded, reset everything
         if not current_file_names:
             st.session_state.df = None
             st.session_state.processed_files = []
-        # If some files were removed, check if we need to reprocess
         elif set(current_file_names) != set(st.session_state.processed_files):
-            # Files have changed, need to reprocess
             st.session_state.df = None
             st.session_state.processed_files = []
     else:
-        # No files uploaded, reset everything
         st.session_state.df = None
         st.session_state.processed_files = []
     
@@ -185,7 +258,6 @@ def main():
                 for file in valid_files:
                     st.write(f"• {file.name}")
         
-        # Only process if we don't have data or if files have changed
         if valid_files and st.session_state.df is None:
             with st.spinner("Processing uploaded files..."):
                 all_logs = []
@@ -216,7 +288,6 @@ def main():
                                     file_logs.append(parsed_log)
                         
                         all_logs.extend(file_logs)
-                        
                         progress_bar.progress((i + 1) / len(valid_files))
                         
                     except Exception as e:
@@ -227,7 +298,6 @@ def main():
                 if all_logs:
                     st.session_state.df = pd.DataFrame(all_logs)
                     st.session_state.df = parse_timestamps_efficiently(st.session_state.df)
-                    # Update processed files list to match current valid files
                     st.session_state.processed_files = [f.name for f in valid_files]
                     st.success(f"Successfully loaded {len(all_logs)} log entries from {len(valid_files)} files.")
                 else:
@@ -235,51 +305,141 @@ def main():
     
     if st.session_state.df is not None and not st.session_state.df.empty:
         df = st.session_state.df
+        
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🔎 Filter Logs")
+        st.sidebar.subheader("🔎 Advanced Filters")
         
-        search_term = st.sidebar.text_input(
-            "Search in message:", 
-            placeholder="Enter search term...",
-            help="Case-insensitive search in the log message"
+        filter_tabs = st.sidebar.tabs(["Basic", "Advanced"])
+        
+        with filter_tabs[0]: 
+            available_files = sorted(df['source_file'].unique())
+            selected_files = st.multiselect(
+                "Select files:",
+                options=available_files,
+                default=available_files,
+                help="Filter by source file"
+            )
+            
+            available_levels = sorted(df['level'].dropna().unique())
+            selected_levels = st.multiselect(
+                "Log levels:",
+                options=available_levels,
+                default=available_levels,
+                help="Filter by log level"
+            )
+            
+            st.markdown("**Search Configuration:**")
+            use_fuzzy_search = st.checkbox(
+                "Enable fuzzy search",
+                value=False,
+                help="Fuzzy search finds similar matches even with typos"
+            )
+            
+            if use_fuzzy_search:
+                fuzzy_threshold = st.slider(
+                    "Fuzzy match threshold:",
+                    min_value=50,
+                    max_value=100,
+                    value=70,
+                    help="Higher values = more exact matches"
+                )
+            else:
+                fuzzy_threshold = 70
+            
+            search_term = st.text_input(
+                "Search in message:", 
+                placeholder="Enter search term...",
+                help="Search in log messages. Use fuzzy search for typo-tolerant matching."
+            )
+            
+            if search_term and use_fuzzy_search:
+                st.info(f"🔍 Fuzzy search enabled with {fuzzy_threshold}% threshold")
+        
+        with filter_tabs[1]:  
+            date_range = None
+            if 'timestamp' in df.columns and not df['timestamp'].empty:
+                valid_timestamps = df['timestamp'].dropna()
+                if not valid_timestamps.empty:
+                    min_date = valid_timestamps.dt.date.min()
+                    max_date = valid_timestamps.dt.date.max()
+                    
+                    use_date_filter = st.checkbox("Filter by date range")
+                    if use_date_filter:
+                        date_range = st.date_input(
+                            "Select date range:",
+                            value=(min_date, max_date),
+                            min_value=min_date,
+                            max_value=max_date
+                        )
+                        if isinstance(date_range, tuple) and len(date_range) == 2:
+                            pass  # Valid range
+                        else:
+                            date_range = None
+            
+            time_range = None
+            use_time_filter = st.checkbox("Filter by time range")
+            if use_time_filter:
+                start_time = st.time_input("Start time:", value=datetime.min.time())
+                end_time = st.time_input("End time:", value=datetime.max.time())
+                time_range = (start_time, end_time)
+            
+            available_functions = sorted(df['function'].dropna().unique())
+            selected_functions = st.multiselect(
+                "Filter by function:",
+                options=available_functions,
+                help="Filter by function name"
+            )
+            
+            available_names = sorted(df['name'].dropna().unique())
+            selected_names = st.multiselect(
+                "Filter by logger name:",
+                options=available_names,
+                help="Filter by logger name"
+            )
+        
+        
+        filtered_df = filter_logs(
+            df, search_term, selected_levels, selected_files, date_range,
+            time_range, selected_functions, selected_names,
+            use_fuzzy_search, fuzzy_threshold
         )
         
-        available_levels = sorted(df['level'].dropna().unique())
-        selected_levels = st.sidebar.multiselect(
-            "Log levels:",
-            options=available_levels,
-            default=available_levels,
-            help="Filter by log level"
-        )
+        if use_fuzzy_search and search_term and 'fuzzy_score' in filtered_df.columns:
+            st.info(f"Showing {len(filtered_df)} fuzzy matches of {len(df)} total entries (threshold: {fuzzy_threshold}%)")
+        else:
+            st.info(f"Showing {len(filtered_df)} of {len(df)} total log entries based on filters.")
         
-        filtered_df = filter_logs(df, search_term, selected_levels)
+        st.subheader("📊 Statistics")
+        stats = get_log_stats(filtered_df)
         
-        st.info(f"Showing {len(filtered_df)} of {len(df)} total log entries based on filters.")
-        
-        st.subheader("📊 Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Entries", len(df))
-        with col2:
-            st.metric("Filtered Entries", len(filtered_df))
-        with col3:
-            st.metric("Files Processed", len(st.session_state.processed_files))
-        with col4:
-            if not df.empty:
-                unique_levels = len(df['level'].dropna().unique())
-                st.metric("Log Levels", unique_levels)
+        metrics_cols = st.columns(4)
+        with metrics_cols[0]:
+            st.metric("Total Entries", stats.get('total_entries', 0))
+        with metrics_cols[1]:
+            st.metric("Error Count", stats.get('errors_count', 0))
+        with metrics_cols[2]:
+            st.metric("Warning Count", stats.get('warnings_count', 0))
+        with metrics_cols[3]:
+            st.metric("Files", len(selected_files))
         
         st.subheader("📋 Detailed Log Entries")
         
-        col1, col2 = st.columns([3, 1])
-        with col1:
+        display_cols = st.columns([3, 1])
+        with display_cols[0]:
+            default_columns = ['timestamp', 'level', 'message', 'source_file']
+            if use_fuzzy_search and search_term and 'fuzzy_score' in filtered_df.columns:
+                default_columns.append('fuzzy_score')
+            
+            available_columns = ['timestamp', 'level', 'message', 'source_file', 'function', 'filename', 'line_number', 'name']
+            if 'fuzzy_score' in filtered_df.columns:
+                available_columns.append('fuzzy_score')
+            
             show_columns = st.multiselect(
                 "Select columns to display:",
-                options=['timestamp', 'level', 'message', 'source_file', 'function', 'filename', 'line_number', 'name'],
-                default=['timestamp', 'level', 'message', 'source_file']
+                options=available_columns,
+                default=default_columns
             )
-        with col2:
+        with display_cols[1]:
             rows_per_page = st.selectbox("Rows per page:", [25, 50, 100, 200, 500], index=1)
 
         if show_columns and not filtered_df.empty:
@@ -294,6 +454,10 @@ def main():
             end_idx = start_idx + rows_per_page
             display_df = filtered_df.iloc[start_idx:end_idx]
             
+            if 'fuzzy_score' in display_df.columns:
+                display_df = display_df.copy()
+                display_df['fuzzy_score'] = display_df['fuzzy_score'].apply(lambda x: f"{x}%" if pd.notna(x) else "")
+            
             st.dataframe(
                 display_df[show_columns],
                 use_container_width=True,
@@ -303,12 +467,13 @@ def main():
             if total_pages > 1:
                 st.write(f"Showing page {page} of {total_pages} ({len(filtered_df)} total matching entries)")
         elif filtered_df.empty:
-             st.warning("No logs match the current filters.")
+            st.warning("No logs match the current filters.")
         else:
             st.warning("Please select at least one column to display.")
 
     else:
         st.info("Please upload log files to begin analysis.")
+        
 
 if __name__ == "__main__":
     main()
